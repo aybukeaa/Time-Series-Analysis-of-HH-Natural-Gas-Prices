@@ -1,0 +1,381 @@
+---
+title: "STAT 497 TERM PROJECT"
+author: "Aybüke Altuntaş 2361095"
+date: "2023-01-23"
+output: html_document
+---
+## Required libraries:
+```{r,warning=FALSE,message=FALSE}
+library(fUnitRoots) 
+library(caschrono)
+library(timetk)
+library(fpp2)
+library(TSA)
+library(xts)
+library(tsbox)
+library(forecast)
+library(gridExtra)
+library(fpp2)
+library(tseries)
+library(dplyr)
+library(pdR)
+library(ggplot2)
+library(lmtest)
+library(tseries)
+library(tidyverse)  
+library(tidyquant)  
+library(anomalize)  
+library(knitr)
+library(kableExtra)
+```
+
+### Loading data and converting it into time series form
+```{r,warning=FALSE,message=FALSE}
+data <- read.table("tsdata.txt", sep=",")
+names(data)<-c("month","HH_spot_price")
+data$month <- as.factor(data$month)
+# Change Factor to Date format
+data$month <- paste(data$month, "01", sep="-")
+# Select only relevant columns in a new dataframe
+data$month <- as.Date(data$month,format="%Y-%m-%d")
+# Convert df to a tibble
+df <- as_tibble(data)
+class(df)
+```
+
+### Detecting and Cleaning Anomalies
+```{r,warning=FALSE,message=FALSE}
+df_anomalized <- df %>%
+  time_decompose(HH_spot_price, merge = TRUE) %>%
+  anomalize(remainder) %>%
+  clean_anomalies() %>%
+  time_recompose()
+df_anomalized %>% glimpse()
+
+p1 <- df_anomalized %>%
+  plot_anomaly_decomposition() +
+  ggtitle("Freq/Trend = 'auto'")
+p1
+
+df_anomalized %>% 
+  filter(anomaly == "Yes") %>%
+  select(month, anomaly, observed, observed_cleaned) %>%
+  kable()%>%
+  kable_paper(bootstrap_options = "striped", full_width = F)%>%
+  kable_styling(fixed_thead = T)
+```
+
+The anomalies in the data is removed and replaced by interpolated values.
+
+```{r,warning=FALSE,message=FALSE}
+# Changing tible format to ts class
+ts <- as.data.frame(df_anomalized)
+x <- df_anomalized %>%
+  select(month, observed_cleaned) %>%
+  as.ts()
+spotprice <-ts(x[,2],start=c(1997,1),frequency=12) #To convert it time series format we use ts() function
+head(spotprice)
+class(spotprice)
+```
+
+### Descriptive statistics
+```{r,warning=FALSE,message=FALSE}
+summary(spotprice)
+```
+
+### Data visualization
+```{r,warning=FALSE,message=FALSE}
+autoplot(spotprice, main="Time Series Plot for Henry Hub Natural Gas Spot Price, Monthly",col="red")
+```
+It is not stationary, it has an increasing trend. It also displays some up’s and down’s which are the indication of stochastic trend.
+
+### Splitting data into train and test
+
+After cleaning anomalies, the data set is divided into test set and train set. While doing this, the last 12 observations are kept as test set since monthly data is used.
+
+```{r,warning=FALSE,message=FALSE}
+train<-window(spotprice,end=c(2020,3))
+test<-window(spotprice,start=c(2020,4))
+```
+
+### Transformations
+
+Boxcox transformation is applied for the data set to stabilize the variance.
+```{r,warning=FALSE,message=FALSE}
+lambda<-BoxCox.lambda(train)
+trans<-BoxCox(train,lambda)
+autoplot(trans)
+```
+
+
+```{r,warning=FALSE,message=FALSE}
+p1<-ggAcf(trans,main="ACF of Henry Hub Natural Gas Spot Price, Monthly")
+p2<-ggPacf(trans,main="PACF of Henry Hub Natural Gas Spot Price, Monthly")
+grid.arrange(p1,p2,nrow=1)
+```
+
+There exists an exponential decay in ACF also lags aren't in White Noise band
+
+### Box plot across months to explore seasonal effects
+
+```{r,warning=FALSE,message=FALSE}
+boxplot(trans~cycle(trans),xlab="month",ylab="Henry Hub Natural Gas Spot Price") 
+```
+
+Since the median values for each month are not equal to each other, it appears that we have a seasonal component each year. Also, we see that there are outliers present.
+
+### Checking trend stationarity and unit root
+
+```{r,warning=FALSE,message=FALSE}
+kpss.test(trans,null=c("Level"))
+```
+
+Since p value is less than alpha, we reject H0. That means we don’t have enough evidence to claim that the process is stationary.
+
+```{r,warning=FALSE,message=FALSE}
+kpss.test(trans, null=c("Trend"))
+```
+
+Since p value is less than alpha, we reject H0. That means we have enough evidence to claim that the process has stochastic trend.
+
+```{r,warning=FALSE,message=FALSE}
+mean(trans)
+adfTest(trans,lags=4,type="c")
+adfTest(trans,lags=4,type="ct")
+```
+
+Since p value is greater than α=0.05 , we fail to reject H0. It means that we have non stationary system having unit root.
+
+### Checking Seasonality
+
+```{r,warning=FALSE,message=FALSE}
+out<-HEGY.test(wts=trans, itsd=c(1,0,0), regvar=0, selectlags=list(mode="signf", Pmax=NULL))
+out$stats
+```
+
+The data don’t have any seasonality problem.
+
+To remove unit root, non-stationarity, and stochastic trend, I need to apply differencing. To see how many times I need to apply differencing:
+
+```{r,warning=FALSE,message=FALSE}
+ndiffs(trans)
+nsdiffs(trans)
+```
+
+One regular difference is needed.
+
+```{r,warning=FALSE,message=FALSE}
+autoplot(diff(trans),main="Differenced TS Plot of Henry Hub Natural Gas Spot Price")
+```
+
+#### ACF and PACF of differenced and transformed data
+```{r,warning=FALSE,message=FALSE}
+p1<-ggAcf(diff(trans))
+p2<-ggPacf(diff(trans))
+grid.arrange(p1,p2,nrow=1)
+```
+
+
+```{r,warning=FALSE,message=FALSE}
+adfTest(diff(trans), type="nc")
+```
+
+ADF result shows that unit root, non-stationarity, and stochastic trend are removed.
+
+## MODEL SELECTION
+
+After differencing, we have enough evidence to conclude that differenced series are stationary. Also stochastic trend is removed. After removing non-stationary in the series, we can suggest a model.
+
+```{r,warning=FALSE,message=FALSE}
+fit <- Arima(trans,order=c(0,1,0),seasonal = c(1,0,1))
+fit
+```
+
+
+```{r,warning=FALSE,message=FALSE}
+fit1 <- Arima(trans,order=c(0,1,0),seasonal = c(0,0,0))
+fit1
+```
+
+
+```{r,warning=FALSE,message=FALSE}
+fit2 <- Arima(trans,order=c(1,1,0),seasonal = c(1,0,0))
+fit2
+```
+
+
+```{r,warning=FALSE,message=FALSE}
+fit3 <- Arima(trans,order=c(0,1,1),seasonal = c(0,0,0))
+fit3
+```
+
+
+```{r,warning=FALSE,message=FALSE}
+fit4 <- Arima(trans,order=c(1,1,1),seasonal = c(0,0,0))
+fit4
+```
+
+
+```{r,warning=FALSE,message=FALSE}
+fit5 <- Arima(trans,order=c(0,1,2),seasonal = c(0,0,0))
+fit5
+```
+
+
+```{r,warning=FALSE,message=FALSE}
+fit6 <- Arima(trans,order=c(1,1,2),seasonal = c(1,0,0))
+fit6
+```
+
+
+```{r,warning=FALSE,message=FALSE}
+fit7 <- auto.arima(trans)
+fit7
+```
+
+
+```{r,warning=FALSE,message=FALSE}
+eacf(trans)
+```
+
+If the ratio between these estimates and their standard errors (s.e) are greater than +2 or less than -2 , we can say that these parameters are significant and the model is significant. After considering the way , we can say that the fourth model ARIMA(1,1,1)(0,0,0)[12] is the only significant model also it has the lowest AIC value. Thus, I’ll continue with it.
+
+## Diagnostic Check
+
+#### 1. Normality of Residuals
+
+```{r,warning=FALSE,message=FALSE}
+r <- resid(fit4)
+ggplot(r, aes(sample = r)) +stat_qq()+geom_qq_line()+ggtitle("QQ Plot of the Residuals")+theme_minimal()
+ggplot(r,aes(x=r))+geom_histogram(bins=20)+geom_density()+ggtitle("Histogram of Residuals")+theme_minimal()
+```
+
+Since the Q-Q plot shows the most of the residuals of the model lie on 45 degree straight line. This indicates residuals may normally distributed
+
+```{r,warning=FALSE,message=FALSE}
+shapiro.test(r)
+```
+
+To be sure about non-normality, Shapiro-Wilk test should be applied. Unfortunately, test result shows that errors do not distributed normally (p<0.05). We have non-normal residuals. But we assume normality.
+
+### Detection of Serial Correlation
+
+```{r,warning=FALSE,message=FALSE}
+ggAcf(as.vector(r),main="ACF of the Residuals",lag = 23)+theme_minimal()
+```
+
+As seen all spikes are in the White Noise. Thus, it can be concluded that our residuals are uncorrelated
+
+```{r,warning=FALSE,message=FALSE}
+Box.test(r,lag=2,type = c("Ljung-Box")) 
+```
+
+Since p value is greater than alpha, we have 95% confident that the residuals of the model are uncorrelated, according to results of Box-Ljung Test.
+
+```{r,warning=FALSE,message=FALSE}
+Box.test(r,lag=2,type = c("Box-Pierce")) 
+```
+
+Since p value is greater than alpha, we have 95% confident that the residuals of the model are uncorrelated, according to results of Box-Pierce Test.
+
+### 3.Heteroscedasticity
+
+```{r,warning=FALSE,message=FALSE}
+rr=r^2
+g1<-ggAcf(as.vector(rr))+theme_minimal()+ggtitle("ACF of Squared Residuals")
+g2<-ggPacf(as.vector(rr))+theme_minimal()+ggtitle("PACF of Squared Residuals")  # homoscedasticity check
+grid.arrange(g1,g2,ncol=2) 
+```
+
+Both plots shows that there is no spikes out of the white noise bands so there is no heteroscedasticity problem.
+
+```{r,warning=FALSE,message=FALSE}
+m = lm(r ~ trans+zlag(trans)+zlag(trans,2))
+bptest(m) 
+```
+
+Since p value is greater than alpha, we fail reject Ho. Therefore, we can say that we have enough evidence to claim that there is no heteroscedasticity problem, according to results of Breusch-Pagan test. So all assumptions are satisfied.
+
+## Forecasting
+
+### ARIMA
+
+```{r,warning=FALSE,message=FALSE}
+f<-forecast(fit4,h=12)
+```
+
+Accuracy results of ARIMA model.
+```{r,warning=FALSE,message=FALSE}
+accuracy(f,test)
+f1<-InvBoxCox(f$mean,lambda)
+accuracy(f1,test)
+```
+
+Forecast plot of ARIMA model.
+```{r,warning=FALSE,message=FALSE}
+autoplot(f)+theme_minimal()+ggtitle("Forecast of ARIMA")
+```
+
+Then, let me apply time series decomposition to analyze whether time series components exhibit additive or multiplicative behavior.
+
+```{r,warning=FALSE,message=FALSE}
+autoplot(stl(train,s.window = 12))
+```
+
+The data shows multiplicative behavior.
+
+#### ETS
+
+It is seen that we have exponential smoothing model having multiplicative error. After fitting the model, the residuals of the ETS model is checked by Shapiro-Wilk test and seen that they do not follow normal distribution. (p<0.05)
+
+```{r,warning=FALSE,message=FALSE}
+etsfit<-ets(train, model="MNN") # Simple exponential smoothing with multiplicative errors.
+summary(etsfit)
+```
+
+
+```{r,warning=FALSE,message=FALSE}
+rets <- etsfit$residuals
+shapiro.test(rets)
+```
+
+Accuracy results of ETS model.
+```{r,warning=FALSE,message=FALSE}
+etsf <-forecast(etsfit,h=12)
+accuracy(etsf,test)
+```
+
+Forecast plot of ETS model.
+```{r,warning=FALSE,message=FALSE}
+autoplot(etsf)
+```
+
+#### NN
+
+The model is NNAR(16,1,8)[12]. It is a neural network with the last one observation Y_(t-1)  as input for forecasting output Y_(t )and one neuron in the hidden layer. If we are looking at NN residuals, we have non-normal residuals according to Shapiro-Wilk test. (p<0.05)
+
+```{r,warning=FALSE,message=FALSE}
+nnetarfit<-nnetar(train)
+summary(nnetarfit)
+```
+
+
+```{r,warning=FALSE,message=FALSE}
+rnnetar <- nnetarfit$residuals
+shapiro.test(rnnetar)
+```
+
+Accuracy results of NN model.
+```{r,warning=FALSE,message=FALSE}
+nnetarf <-forecast(nnetarfit,h=12)
+accuracy(nnetarf,test)
+```
+
+Forecast plot of NN model.
+```{r,warning=FALSE,message=FALSE}
+autoplot(nnetarf)
+```
+
+### Conclusion
+
+At the end of this, NN has the best performance in both modelling series and predicting future values compared to other models.
